@@ -1,0 +1,51 @@
+import {
+  Box,
+  Disc3,
+  Factory,
+  FunnelPlus,
+  Gauge,
+  GitBranch,
+  Layers,
+  MousePointer2,
+  Route,
+  Ruler,
+  SlidersHorizontal,
+  SquareActivity,
+  Timer,
+  ToggleRight,
+  Wind,
+  Heater,
+  Droplets,
+  Thermometer,
+  Flame,
+  FlameKindling,
+  type LucideIcon,
+} from 'lucide-react'
+
+import { StoveIcon } from './StoveIcon'
+import type { InstallationToolId } from '../core/installationTools'
+
+
+export const INSTALLATION_TOOL_ICONS: Record<InstallationToolId, LucideIcon> = {
+  selection: MousePointer2,
+  regulator: SlidersHorizontal,
+  pipe: Route,
+  chimney: Factory,
+  branch: GitBranch,
+  insulation: Layers,
+  gasMeter: Timer,
+  manometer: Gauge,
+  serviceBox: Box,
+  filterKit: FunnelPlus,
+  valve: Disc3,
+  strainerMeter: SquareActivity,
+  solenoidValve: ToggleRight,
+  ventilationDuct: Wind,
+  stove: StoveIcon,
+  spaceHeater: Heater,
+  waterHeater: Droplets,
+  combiBoiler: Thermometer,
+  boiler: Flame,
+  otherAppliance: FlameKindling,
+  measurement: Ruler,
+}

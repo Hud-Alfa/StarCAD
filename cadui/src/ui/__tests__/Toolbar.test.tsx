@@ -1,0 +1,149 @@
+import { render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  ARCHITECTURE_TOOL_GROUPS,
+  ARCHITECTURE_TOOLS,
+  DEFAULT_TOOL_ID,
+  type ToolDefinition,
+} from '../../core/tools'
+import { useUiStore } from '../../store/uiStore'
+import { Toolbar, ToolButton } from '../Toolbar'
+import { TOOL_ICONS } from '../tools/toolIcons'
+
+/** Herhangi bir ikon; test ikonun kendisini değil PASİFLİĞİ ölçüyor. */
+const ARCHITECTURE_TOOL_ICON = TOOL_ICONS.measure
+
+beforeEach(() => {
+  useUiStore.setState({ activeToolId: DEFAULT_TOOL_ID })
+})
+
+describe('Toolbar', () => {
+  it('gruplardaki araçların tamamını sırayla gösterir (KK-8)', () => {
+    render(<Toolbar />)
+    // Sayım nav ile sınırlı: kısayol ipucu butonu palet dışında, araç değil.
+    const buttons = within(screen.getByRole('navigation', { name: 'Araç paleti' })).getAllByRole(
+      'button',
+    )
+    const paletteTools = ARCHITECTURE_TOOL_GROUPS.flatMap(
+      (group) => group.tools as readonly ToolDefinition[],
+    )
+
+    expect(buttons).toHaveLength(paletteTools.length)
+    // Henüz yazılmamış araçların erişilebilir adı sebebi de söyler (K79).
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual(
+      paletteTools.map((tool) =>
+        'isPlanned' in tool ? `${tool.label} (henüz eklenmedi)` : tool.label,
+      ),
+    )
+  })
+
+  it('Seçim Aracı palette YOK — yüzen çubukta duruyor (K83)', () => {
+    // Aynı kip iki palette birden dururken kullanıcı hangisinin "asıl"
+    // olduğunu bilemiyordu. Araç olarak var olmaya devam ediyor.
+    render(<Toolbar />)
+
+    expect(screen.queryByRole('button', { name: 'Seçim Aracı' })).not.toBeInTheDocument()
+    expect(ARCHITECTURE_TOOLS.some((tool) => tool.id === DEFAULT_TOOL_ID)).toBe(true)
+  })
+
+  it('araçlar gruplara ayrılmış ve gruplar sırada (K82)', () => {
+    render(<Toolbar />)
+
+    const groups = within(screen.getByRole('navigation', { name: 'Araç paleti' })).getAllByRole(
+      'group',
+    )
+
+    expect(groups.map((group) => group.getAttribute('aria-label'))).toEqual(
+      ARCHITECTURE_TOOL_GROUPS.map((group) => group.label),
+    )
+  })
+
+  it('paletteki her araç TAM BİR grupta — hiçbiri iki kez yok', () => {
+    // Grup yapısı yerleşim bilgisi; düzleştirilmiş liste ikon kaydının ve
+    // durum çubuğunun kaynağı, ikisi ayrışırsa araç sessizce kaybolur.
+    const grouped = ARCHITECTURE_TOOL_GROUPS.flatMap((group) => group.tools.map((tool) => tool.id))
+    const known = new Set(ARCHITECTURE_TOOLS.map((tool) => tool.id))
+
+    expect(new Set(grouped).size).toBe(grouped.length)
+    for (const id of grouped) expect(known.has(id)).toBe(true)
+  })
+
+  it('"Toplu Silme" palette YOK (K79)', () => {
+    // İşi zaten var: çerçeveyle çoklu seçim + Delete, hem de tek adımda.
+    render(<Toolbar />)
+
+    expect(screen.queryByRole('button', { name: /Toplu Silme/ })).not.toBeInTheDocument()
+  })
+
+  it('henüz yazılmamış araç PASİF — tıklanınca aktif araç değişmez', async () => {
+    // Doğrudan `ToolButton` üzerinden: palette bugün PLANLI araç KALMADI
+    // (sonuncusu serbest çizimdi, K163'te yazıldı). Mekanizma duruyor ve yeni
+    // bir planlı araç eklendiğinde çalışmalı, bu yüzden test silinmedi —
+    // konusunu listeden değil bileşenden alıyor.
+    const user = userEvent.setup()
+    const onSelect = vi.fn()
+    render(
+      <ToolButton
+        toolId="planlanan"
+        label="Planlanan Araç"
+        icon={ARCHITECTURE_TOOL_ICON}
+        isActive={false}
+        isPlanned
+        onSelect={onSelect}
+      />,
+    )
+
+    const planned = screen.getByRole('button', { name: 'Planlanan Araç (henüz eklenmedi)' })
+    expect(planned).toBeDisabled()
+
+    await user.click(planned)
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(useUiStore.getState().activeToolId).toBe(DEFAULT_TOOL_ID)
+  })
+
+  it('Ölçüm aracı ARTIK etkin (K80)', async () => {
+    const user = userEvent.setup()
+    render(<Toolbar />)
+
+    await user.click(screen.getByRole('button', { name: 'Ölçüm' }))
+
+    expect(useUiStore.getState().activeToolId).toBe('measure')
+  })
+
+  it('Metin Ekle ARTIK etkin (K81)', async () => {
+    const user = userEvent.setup()
+    render(<Toolbar />)
+
+    await user.click(screen.getByRole('button', { name: 'Metin Ekle' }))
+
+    expect(useUiStore.getState().activeToolId).toBe('text')
+  })
+
+  it('açılışta hiçbir palet aracı vurgulu DEĞİL — varsayılan seçim kipi (KK-7)', () => {
+    // Seçim aracı palette olmadığı için (K83) vurgu da orada görünmüyor;
+    // aktif kipi yüzen çubuk söylüyor (durum çubuğu kalktı).
+    render(<Toolbar />)
+
+    const buttons = within(screen.getByRole('navigation', { name: 'Araç paleti' })).getAllByRole(
+      'button',
+    )
+    for (const button of buttons) expect(button).toHaveAttribute('aria-pressed', 'false')
+    expect(useUiStore.getState().activeToolId).toBe(DEFAULT_TOOL_ID)
+  })
+
+  it('araç tıklanınca vurgulanır (KK-7)', async () => {
+    const user = userEvent.setup()
+    render(<Toolbar />)
+
+    await user.click(screen.getByRole('button', { name: 'Duvar Çiz' }))
+
+    expect(screen.getByRole('button', { name: 'Duvar Çiz' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(screen.getByRole('button', { name: 'Oda Çiz' })).toHaveAttribute('aria-pressed', 'false')
+    expect(useUiStore.getState().activeToolId).toBe('drawWall')
+  })
+})

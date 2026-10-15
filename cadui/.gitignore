@@ -1,0 +1,38 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Paket analizi çıktısı (`vite build --mode analyze`); üretilen bir rapor,
+# kaynak değil.
+stats.html
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+CLAUDE_INSTALLATION_PLAN.md
+webcad-format.md
+tesisat_eleman.md
+tesisat-panel-adimlari.md
+izometrik.md
+izometrik_bilgi.md
+izometrik_ornek.png
+izometrik_ornek.wcp
+izometrik-adimlari.md

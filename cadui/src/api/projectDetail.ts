@@ -1,0 +1,498 @@
+import { z } from 'zod'
+
+import { listProjectDocuments } from './documents'
+import { ApiError, requestJson } from './http'
+import { listProjectPolicies } from './policies'
+import {
+  type ProjectDetail,
+  type ProjectDetailExtras,
+  type ProjectDetailStatus,
+  type ProjectDocumentRow,
+  type ProjectHistoryRow,
+  type ProjectPolicyRow,
+  type ProjectFirmInfo,
+  type ProjectServerFields,
+  type ProjectSummary,
+  type ProjectUnitRow,
+} from './projectDetailTypes'
+import { getProjectFirm } from './projectFirmForm'
+import { toProjectStatus } from './projects'
+import { isEndpointImplemented } from './unimplementedEndpoints'
+
+/**
+ * Tipler ayrı dosyada ama modülün public yüzü BURASI: çağıranlar tek yerden
+ * import etsin diye yeniden dışa aktarılıyorlar (barrel değil — bu modülün
+ * kendi API'si).
+ */
+export * from './projectDetailTypes'
+
+/**
+ * API SÖZLEŞMESİ — Proje detayı.
+ *
+ * GERÇEK ve bağlı olan tek uç:
+ *   GET /api/projects/{id} → ProjectDetailDto
+ *   { id, name, description, buildingCode, projectFirmAuthorizationId,
+ *     gasDistributionFirmId, cityId, cityName, districtId, districtName,
+ *     addressLine, blockLotParcel, createdAt, updatedAt }
+ *
+ * Bağlı olan diğer GERÇEK uçlar:
+ *   GET  /api/projects/{id}/history → OperationHistoryDto[]
+ *   POST /api/projects/{id}/approve
+ *   POST /api/projects/{id}/reject  → { description }
+ *
+ * Ekranın istediği geri kalan her şeyin (durum, tesisat no, proje/ısınma tipi,
+ * onay bilgileri, teknik değerler, birim/cihaz, evrak, poliçe,
+ * .zpd / DWG / PDF indirme) uçta karşılığı YOK. Tamamı
+ * `unimplementedEndpoints.ts` içinde bayraklı; oradaki satır silinince buradaki
+ * `isEndpointImplemented` çağrısı DERLEME HATASI verir (doğrulandı).
+ */
+
+const projectDetailDtoSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string(),
+  description: z.string().nullish(),
+  projectFirmId: z.number().int().nullish(),
+  gasDistributionFirmId: z.number().int().nullish(),
+  buildingCode: z.string().nullish(),
+  // Bina kat sayıları. Alan bir süre `ProjectDetailDto`'da YOKTU (yalnız
+  // `Building` tablosunda duruyordu) ve "Kat Adedi" hep boş görünüyordu;
+  // sunucu artık projeksiyonda taşıyor (`ProjectManager.GetByIdAsync`).
+  floorCount: z.number().int().nullish(),
+  basementCount: z.number().int().nullish(),
+  /** Yetki kaydından türetilen gaz dağıtım firmasının ünvanı. */
+  gasDistributionFirmName: z.string().nullish(),
+  cityName: z.string().nullish(),
+  districtName: z.string().nullish(),
+  addressLine: z.string().nullish(),
+  blockLotParcel: z.string().nullish(),
+  /**
+   * ⚠️ Detay yanıtı bina kodunu `code` diye döndürüyor, LİSTE ucu
+   * `buildingCode` diye — ikisi de okunuyor (canlı yanıtta ölçüldü).
+   */
+  code: z.string().nullish(),
+  // Aşağıdakiler K159'de eklendi: kapak bunları ÖNCEDEN mock `extras`tan
+  // okuyordu, uç zaten döndürüyormuş.
+  //
+  // ⚠️ `projectFirmId` YOK: OpenAPI örneğinde görünüyor ama canlı yanıt onu
+  // döndürmüyor, yerine yetki kaydının kimliğini veriyor. Firma künyesi bu
+  // yüzden `project-firm-authorizations` üzerinden çözülüyor (K159).
+  projectFirmAuthorizationId: z.number().int().nullish(),
+  status: z.string().nullish(),
+  statusName: z.string().nullish(),
+  projectTypeName: z.string().nullish(),
+  heatingTypeName: z.string().nullish(),
+  buildingUsageTypeName: z.string().nullish(),
+  isPermitProject: z.boolean().nullish(),
+  apartmentCount: z.number().int().nullish(),
+  workplaceCount: z.number().int().nullish(),
+  // Adetlerin aksine tam sayı DEĞİL: alan kesirli gelebiliyor (120,5 m²).
+  areaSquareMeters: z.number().nullish(),
+  capacity: z.number().int().nullish(),
+  serviceBoxPressureMbar: z.number().int().nullish(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+})
+
+/** Liste eşlemesiyle AYNI kural (projects.ts): bina kodu boşsa kimlik yedeğe düşer. */
+function toProjectPId(raw: { id: number; buildingCode?: string | null }): string {
+  const buildingCode = raw.buildingCode?.trim()
+  return buildingCode === undefined || buildingCode === '' ? String(raw.id) : buildingCode
+}
+
+function toNullable(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed === undefined || trimmed === '' ? null : trimmed
+}
+
+/**
+ * `GET /api/projects/{id}` — GERÇEK uç. Yanıtın taşımadığı alanlar ayrı bir
+ * bayrağın arkasında; bu yüzden tek bir istek iki kaynaklı bir sonuç üretiyor.
+ */
+export async function getProjectDetail(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectDetail> {
+  const dto = await requestJson(
+    { method: 'GET', path: `/api/projects/${projectId}`, signal },
+    projectDetailDtoSchema,
+  )
+
+  const server: ProjectServerFields = {
+    id: dto.id,
+    // Bina kodu iki ad altında gelebiliyor; ikisi de denenip id'ye düşülüyor.
+    pId: toProjectPId({ id: dto.id, buildingCode: dto.buildingCode ?? dto.code }),
+    name: dto.name,
+    description: toNullable(dto.description),
+    // Durum GERÇEK uçtan. Bir süre kimlikten uyduruluyordu (`mockStatusOf`)
+    // çünkü detay yanıtı `Status` taşımıyordu; backend a6ea695 ile taşımaya
+    // başladı ve liste ile detay artık ayrışamıyor — ikisi de `toProjectStatus`
+    // çeviricisinden geçiyor.
+    status: toProjectStatus(dto.status),
+    cityName: toNullable(dto.cityName),
+    districtName: toNullable(dto.districtName),
+    addressLine: toNullable(dto.addressLine),
+    blockLotParcel: toNullable(dto.blockLotParcel),
+    projectFirmAuthorizationId: dto.projectFirmAuthorizationId ?? null,
+    gasDistributionFirmId: dto.gasDistributionFirmId ?? null,
+    gasDistributionFirmName: toNullable(dto.gasDistributionFirmName),
+    floorCount: dto.floorCount ?? null,
+    basementCount: dto.basementCount ?? null,
+    projectTypeName: toNullable(dto.projectTypeName),
+    heatingTypeName: toNullable(dto.heatingTypeName),
+    apartmentCount: dto.apartmentCount ?? null,
+    workplaceCount: dto.workplaceCount ?? null,
+    areaSquareMeters: dto.areaSquareMeters ?? null,
+    buildingCode: toNullable(dto.buildingCode ?? dto.code),
+    // Uç bu alanı DÖNDÜRÜYOR: `ProjectManager.GetByIdAsync` onu yetki kaydından
+    // türetip gövdeye yazıyor (`ProjectFirmId = p.ProjectFirmAuthorization
+    // .ProjectFirmId`). Bir süre burada sabit `null` duruyordu ve firma künyesi
+    // isteği hiç açılmıyordu — kart bu yüzden tümüyle boş görünüyordu.
+    projectFirmId: dto.projectFirmId ?? null,
+    projectType: toNullable(dto.projectTypeName),
+    heatingType: toNullable(dto.heatingTypeName),
+    buildingUsageType: toNullable(dto.buildingUsageTypeName),
+    isPermitProject: dto.isPermitProject ?? false,
+    capacityCubicMeterPerHour: dto.capacity ?? null,
+    serviceBoxPressureMbar: dto.serviceBoxPressureMbar ?? null,
+    createdAt: dto.createdAt,
+    updatedAt: dto.updatedAt,
+  }
+
+  return { server, extras: buildExtras(server) }
+}
+
+/**
+ * Sunucunun DÖNDÜRDÜĞÜ alanlardan türetilen ek bölümler.
+ *
+ * Bu paket eskiden tümüyle uydurmaydı (`buildMockProjectExtras`) ve yalnız
+ * geliştirme derlemesinde çiziliyordu. Uç otuz alan döndürdüğü için artık
+ * çoğunun gerçek karşılığı var; KARŞILIĞI OLMAYAN alan `null` bırakılıyor ve
+ * hücre boş işaretini çiziyor — uydurma bir değer yazmak, bir demoda gerçek
+ * sanılırdı.
+ *
+ * Hâlâ kaynağı olmayanlar (ayrı bir uç isterler): firma mühendisi ve vergi
+ * bilgileri, onay tarihi/onaylayan.
+ */
+function buildExtras(server: ProjectServerFields): ProjectDetailExtras {
+  return {
+    general: {
+      status: server.status,
+      // Uçtan GELİYOR; bir süre boş dize bırakılıp mock işaretiyle çiziliyordu.
+      gasFirmName: server.gasDistributionFirmName ?? '',
+      projectType: server.projectType ?? '',
+      heatingType: server.heatingType ?? '',
+      hasLicense: server.isPermitProject,
+    },
+    firm: { title: null, address: null, phone: null, taxNumber: null },
+    approval: { approvedAt: null, approverName: null, note: null },
+    specs: {
+      floorCount: server.floorCount,
+      residenceCount: server.apartmentCount,
+      shopCount: server.workplaceCount,
+      boxPressureMbar: server.serviceBoxPressureMbar,
+      totalAreaSquareMeters: server.areaSquareMeters,
+      totalCapacity: server.capacityCubicMeterPerHour,
+      renovationNote: null,
+      // "Bağlantı Nesnesi" sunucuda bina kodunun kendisi (backend 91baf4c).
+      connectionObject: server.buildingCode,
+    },
+  }
+}
+
+const NOT_FOUND = 404
+
+/**
+ * Bir projeye bağlı açılan ekranların künyesi (`?project=<id>`). Kaynak, detay
+ * ekranını besleyen GERÇEK uç.
+ *
+ * Künye mock tohumlarından okunduğu sürece iki türlü yanlış davranıyordu:
+ * sunucudaki proje tohum listesinde yoksa ekran açılmıyor, kimlik tesadüfen bir
+ * tohuma denk gelirse BAŞKA bir projenin adı gösteriliyordu (K63).
+ *
+ * 404 `null` döner (kimlik geçersiz — ekran sebebini yazar); ağ/sunucu hatası
+ * FIRLATIR, çünkü "proje yok" ile "sunucuya ulaşılamadı" farklı sonuçlar.
+ */
+export async function getProjectSummary(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectSummary | null> {
+  try {
+    const { server } = await getProjectDetail(projectId, signal)
+    return { id: server.id, name: server.name, pId: server.pId }
+  } catch (error) {
+    if (error instanceof ApiError && error.status === NOT_FOUND) return null
+    throw error
+  }
+}
+
+/**
+ * `GET /api/projects/{id}/units` — GERÇEK uç.
+ *
+ * Satırlar çizimden senkronlanıyor (`unitReport`), bu yüzden neredeyse her alan
+ * opsiyonel: kullanıcı sayacı çizmiş ama abone adını yazmamış olabilir. Şema
+ * bunu `nullish` ile karşılıyor — zorunlu tutulsaydı eksik doldurulmuş tek bir
+ * birim yüzünden tablo hiç açılmazdı.
+ */
+const projectUnitDtoSchema = z.array(
+  z.object({
+    id: z.number().int().positive(),
+    unitNumber: z.string().nullish(),
+    subscriberName: z.string().nullish(),
+    subscriberNo: z.string().nullish(),
+    meterClassLabel: z.string().nullish(),
+    area: z.number().nullish(),
+    flowCubicMeterPerHour: z.number().nullish(),
+    pressureMbar: z.number().nullish(),
+    pipeTypeName: z.string().nullish(),
+    devices: z.array(
+      z.object({
+        id: z.number().int().positive(),
+        deviceType: z.string().nullish(),
+        brand: z.string().nullish(),
+        model: z.string().nullish(),
+        capacity: z.string().nullish(),
+        flowCubicMeterPerHour: z.number().nullish(),
+        flueLabel: z.string().nullish(),
+      }),
+    ),
+  }),
+)
+
+/**
+ * Projenin firma künyesi — GERÇEK uç (`GET /api/projectfirms/{id}`).
+ *
+ * Kimlik detay yanıtından geliyor (`ProjectDetailDto.ProjectFirmId`, yetki
+ * kaydından türetiliyor). Kart bir süre TÜMÜYLE boştu: alanların hiçbirinin
+ * kaynağı okunmuyordu.
+ *
+ * Dört alanın dördü de gövdeden doluyor. Karşılığı olmayan alanlar (firma
+ * mühendisi, sicil numarası, Yeter No) tipten de ekrandan da KALDIRILDI —
+ * `ContactPerson` yetkili kişi, mühendis değil; eşitlemek uydurma olurdu.
+ */
+export async function getProjectFirmInfo(
+  projectFirmId: number,
+  signal?: AbortSignal,
+): Promise<ProjectFirmInfo> {
+  const dto = await getProjectFirm(projectFirmId, { signal })
+
+  return {
+    title: toNullable(dto.title),
+    address: toNullable(dto.address),
+    phone: toNullable(dto.phone),
+    taxNumber: toNullable(dto.taxNumber),
+  }
+}
+
+export async function getProjectUnits(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectUnitRow[]> {
+  const dto = await requestJson(
+    { method: 'GET', path: `/api/projects/${projectId}/units`, signal },
+    projectUnitDtoSchema,
+  )
+
+  return dto.map((unit) => ({
+    id: unit.id,
+    unitNumber: toNullable(unit.unitNumber),
+    subscriberName: toNullable(unit.subscriberName),
+    subscriberNo: toNullable(unit.subscriberNo),
+    meterLabel: toNullable(unit.meterClassLabel),
+    flowCubicMeterPerHour: unit.flowCubicMeterPerHour ?? null,
+    pressureMbar: unit.pressureMbar ?? null,
+    areaSquareMeters: unit.area ?? null,
+    pipeType: toNullable(unit.pipeTypeName),
+    devices: unit.devices.map((device) => ({
+      id: device.id,
+      name: toNullable(device.deviceType),
+      capacity: toNullable(device.capacity),
+      flowCubicMeterPerHour: device.flowCubicMeterPerHour ?? null,
+      brand: toNullable(device.brand),
+      model: toNullable(device.model),
+      flueType: toNullable(device.flueLabel),
+    })),
+  }))
+}
+
+/**
+ * `GET /api/projects/{id}/history` — `OperationHistory` satırları.
+ *
+ * DTO'da `id` ve dosya türü YOK: satır anahtarı damga + kod + sıradan
+ * kuruluyor, "Dosya" sütunu boş çizer. Dizi indeksini TEK BAŞINA anahtar
+ * yapmak, sunucu sırayı değiştirdiğinde React'in yanlış satırı yeniden
+ * kullanmasına yol açardı.
+ */
+const historyDtoSchema = z.array(
+  z.object({
+    operationCode: z.string().nullish(),
+    operationName: z.string().nullish(),
+    description: z.string().nullish(),
+    roleSnapshot: z.string().nullish(),
+    userFullName: z.string().nullish(),
+    createdAt: z.string(),
+  }),
+)
+
+const UNKNOWN_USER_LABEL = 'Bilinmeyen kullanıcı'
+
+export async function getProjectHistory(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectHistoryRow[]> {
+  const dto = await requestJson(
+    { method: 'GET', path: `/api/projects/${projectId}/history`, signal },
+    historyDtoSchema,
+  )
+
+  return dto.map((row, order) => ({
+    id: `${row.createdAt}-${row.operationCode ?? ''}-${order}`,
+    fileType: null,
+    createdAt: row.createdAt,
+    userName: toNullable(row.userFullName) ?? UNKNOWN_USER_LABEL,
+    roleSnapshot: toNullable(row.roleSnapshot) ?? '',
+    // Kod ham geçiyor: bilinen kodda rozet kendi etiketini bulur, bilinmeyende
+    // sunucunun `operationName`'ine düşer (bkz. OperationBadge).
+    operation: toNullable(row.operationCode) ?? '',
+    operationName: toNullable(row.operationName),
+    description: toNullable(row.description),
+  }))
+}
+
+/**
+ * Projenin evrakları — GERÇEK uç (`GET /api/docs?ProjectId=`). Evraklar ekranı
+ * da AYNI ucu kullanıyor, bu yüzden "yüklenen evrak hem projenin evrak
+ * listesine hem genel Evraklar ekranına yansır" (gereksinim 12) kendiliğinden
+ * sağlanıyor — iki ayrı kaynak tutulsaydı aynı evrak birinde görünüp öbüründe
+ * kaybolurdu.
+ *
+ * `uploadedByName` liste gövdesinde YOK (yalnız `DocDetailDto` taşıyor); satır
+ * başına ikinci istek atmamak için boş kalıyor ve hücre boş işaretini çiziyor.
+ */
+export async function getProjectDocuments(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectDocumentRow[]> {
+  const documents = await listProjectDocuments(projectId, signal)
+
+  return documents.map((document) => ({
+    id: document.id,
+    fileName: document.fileName,
+    docType: document.docTypeName,
+    sizeBytes: document.sizeBytes,
+    uploadedByName: document.uploadedByName,
+    receivedAt: document.receivedAt,
+    unitIds: document.unitIds,
+    unitNames: document.unitNames,
+  }))
+}
+
+export async function getProjectPolicies(
+  projectId: number,
+  signal?: AbortSignal,
+): Promise<ProjectPolicyRow[]> {
+  const policies = await listProjectPolicies(projectId, signal)
+
+  return policies.map((policy) => ({
+    id: policy.id,
+    policyNumber: toNullable(policy.policyNumber),
+    // Güncellemede gövdeye GERİ konuyor: gönderilmezse sunucu şirketi null'a
+    // düşürüyor (`PolicyEditTarget`).
+    insuranceCompanyId: policy.insuranceCompanyId ?? null,
+    insuranceCompanyName: toNullable(policy.insuranceCompanyTitle),
+    projectUnitId: policy.projectUnitId ?? null,
+    unitNumber: toNullable(policy.unitNumber),
+    isUnitDeleted: policy.isUnitDeleted ?? false,
+    amount: policy.amount ?? null,
+    startDate: toNullable(policy.startDate),
+    endDate: toNullable(policy.endDate),
+  }))
+}
+
+export type ProjectDecision = 'approve' | 'reject'
+
+/**
+ * Gerekçe zorunlu olan işlemler (KK-10); onay gerekçe istemez. Ayrı bir TİP
+ * olarak duruyor ki gerekçe diyaloğunun metinleri yalnız bunun için
+ * tanımlansın — `ProjectDecision` ile yazılsaydı 'approve' için de bir metin
+ * uydurmak gerekirdi.
+ */
+export type ReasonRequiredDecision = Exclude<ProjectDecision, 'approve'>
+
+export const DECISIONS_REQUIRING_REASON: ReasonRequiredDecision[] = ['reject']
+
+export function requiresReason(decision: ProjectDecision): decision is ReasonRequiredDecision {
+  return DECISIONS_REQUIRING_REASON.some((candidate) => candidate === decision)
+}
+
+export const DECISION_RESULT_STATUS: Record<ProjectDecision, ProjectDetailStatus> = {
+  approve: 'onaylanan',
+  reject: 'reddedilen',
+}
+
+const DECISION_PATHS: Record<ProjectDecision, string> = {
+  approve: 'approve',
+  reject: 'reject',
+}
+
+export interface ProjectDecisionResult {
+  status: ProjectDetailStatus
+  /** Yalnız onayda üretilir (KK-11); uç döndürmezse `null`. */
+  approvalCode: string | null
+}
+
+/** Uç onay kodunu döndürebiliyor; gövde boş/farklı gelirse kod yok sayılır. */
+const decisionResponseSchema = z.object({ approvalCode: z.string().nullish() })
+
+/**
+ * `POST /api/projects/{id}/approve` ve `POST /api/projects/{id}/reject`.
+ *
+ * Ret gerekçesi gövdede (`{ description }`); onay gövde istemiyor. Hata
+ * FIRLATILIR — çağıran (`useProjectDecisions`) yakalayıp bildirimi yazar,
+ * çünkü "reddedildi" demek ancak sunucu 2xx döndüyse doğrudur.
+ */
+export async function submitProjectDecision(
+  projectId: number,
+  decision: ProjectDecision,
+  description: string | null,
+): Promise<ProjectDecisionResult> {
+  const body = await requestJson(
+    {
+      method: 'POST',
+      path: `/api/projects/${projectId}/${DECISION_PATHS[decision]}`,
+      rawJsonBody: decision === 'reject' ? JSON.stringify({ description }) : undefined,
+    },
+    z.unknown(),
+  )
+
+  const parsed = decisionResponseSchema.safeParse(body)
+
+  return {
+    status: DECISION_RESULT_STATUS[decision],
+    approvalCode: parsed.success ? (parsed.data.approvalCode ?? null) : null,
+  }
+}
+
+export type ProjectFileKind = 'zpd' | 'pdfReport'
+
+const FILE_KIND_ENDPOINTS = {
+  zpd: 'projectZpdFile',
+  pdfReport: 'projectPdfReport',
+} as const
+
+export type ProjectFileDownload =
+  | { ok: true; fileName: string; url: string }
+  | { ok: false; reason: 'unimplemented' }
+
+/**
+ * `.zpd` / DWG / PDF indirme. Üçünün de ucu yok ve GELİŞTİRMEDE DE sahte dosya
+ * ÜRETİLMİYOR: indirilen bozuk bir dosya, ekrandaki mock bir değerden çok daha
+ * uzun süre gerçek sanılır (kullanıcının diskinde kalır). Çağıran `ok: false`
+ * görüp ucun eksik olduğunu SÖYLER.
+ */
+export function requestProjectFile(kind: ProjectFileKind): Promise<ProjectFileDownload> {
+  if (isEndpointImplemented(FILE_KIND_ENDPOINTS[kind])) {
+    throw new Error('requestProjectFile: uç bağlandı ama gövdesi yazılmadı.')
+  }
+
+  return Promise.resolve({ ok: false, reason: 'unimplemented' })
+}

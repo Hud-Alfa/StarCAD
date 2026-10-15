@@ -1,0 +1,12 @@
+{
+  "id": "combiBoiler",
+  "label": "Kombi",
+  "asset": "combi-boiler.svg",
+  "viewBox": [0, 0, 50, 50],
+  "origin": [25, 25],
+  "ports": [
+    { "id": "in", "type": "input", "position": [0, 25], "direction": [1, 0] }
+  ],
+  "dischargeBox": { "min": [8, 8], "max": [42, 42] },
+  "bounds": { "min": [0, 0], "max": [50, 50] }
+}

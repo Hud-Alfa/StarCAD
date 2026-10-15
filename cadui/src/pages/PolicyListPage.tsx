@@ -1,0 +1,207 @@
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useMemo } from 'react'
+
+import { deletePolicy, listInsuranceCompanies, listPolicies } from '../api/policies'
+import { ConfirmDialog } from '../ui/admin/ConfirmDialog'
+import { DataTable } from '../ui/admin/DataTable'
+import { FilterChips } from '../ui/admin/FilterChips'
+import { NoticeBar } from '../ui/admin/NoticeBar'
+import { PageHeader } from '../ui/admin/PageHeader'
+import { Pagination } from '../ui/admin/Pagination'
+import { QueryError, QueryLoading, StaleContent } from '../ui/admin/QueryStates'
+import { formatCountLabel } from '../ui/admin/adminFormat'
+import { adminPageWidthVariants } from '../ui/admin/adminPageWidth'
+import { PolicyEditDialog } from '../ui/admin/policies/PolicyEditDialog'
+import { PolicyFilterBar } from '../ui/admin/policies/PolicyFilterBar'
+import {
+  POLICY_TABLE_CAPTION,
+  POLICY_TABLE_MIN_WIDTH_CLASS,
+  buildPolicyColumns,
+} from '../ui/admin/policies/policyColumns'
+import { buildPolicyFilterChips } from '../ui/admin/policies/policyFilterChips'
+import { usePolicyActions } from '../ui/admin/policies/usePolicyActions'
+import { usePolicyListParams } from '../ui/admin/policies/usePolicyListParams'
+import { useHomePath } from '../ui/admin/useHomePath'
+import { useCanWriteProjectContent } from '../ui/admin/useRole'
+import { useRowDelete } from '../ui/admin/useRowDelete'
+
+const PAGE_TITLE = 'Poliçeler'
+
+const EMPTY_WITH_FILTERS =
+  'Kriterlere uyan poliçe bulunamadı. Aramayı veya sigorta şirketi seçimini kaldırın.'
+const EMPTY_WITHOUT_FILTERS =
+  'Sistemde henüz poliçe yok. Poliçe, proje detayındaki "Poliçelendir" ile oluşturulur.'
+
+const DELETE_DIALOG = {
+  title: 'Poliçe silinsin mi?',
+  description: 'Poliçe iptal edilecek ve listeden kaldırılacak.',
+  confirmLabel: 'Sil',
+}
+
+const DELETE_MESSAGES = {
+  success: 'Poliçe silindi.',
+  unavailable:
+    'Poliçe silme ucu sunucuda henüz yok (DELETE /api/policies/{id}); kayıt düşmedi.',
+  error: 'Poliçe silinemedi. Bağlantınızı kontrol edip tekrar deneyin.',
+}
+
+export function PolicyListPage() {
+  const homePath = useHomePath()
+  // Poliçe silme sunucuda `Admin, ProjectFirmUser`'a açık; gaz dağıtım
+  // kullanıcısı listeyi görür ama satır silemez.
+  const canWriteContent = useCanWriteProjectContent()
+  const { query, applyFilters, setPage } = usePolicyListParams()
+  const queryClient = useQueryClient()
+
+  // Sorgu anahtarın PARÇASI: süzme ve sayfalama artık sunucuda, her değişim
+  // yeni bir istek demek. `projectId` bu ekranda `null` — uç onsuz çağrıldığında
+  // kullanıcının görünürlük kapsamındaki tüm poliçeleri döndürüyor.
+  const { data, isPending, isError, isPlaceholderData, refetch } = useQuery({
+    queryKey: ['policies', query],
+    queryFn: ({ signal }) => listPolicies(query, signal),
+    // Sayfa değişince tablo boşalıp zıplamasın; yeni sayfa gelene kadar eskisi durur.
+    placeholderData: keepPreviousData,
+  })
+
+  const { data: companies } = useQuery({
+    queryKey: ['insuranceCompanies'],
+    queryFn: ({ signal }) => listInsuranceCompanies(signal),
+  })
+  const companyRows = companies ?? []
+
+  const refreshList = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ['policies'] })
+    // Proje detayındaki poliçe sekmesi AYNI depodan besleniyor.
+    void queryClient.invalidateQueries({ queryKey: ['projectPolicies'] })
+  }, [queryClient])
+
+  // Güncelleme: yalnız tutar ve tarih. Liste proje BAĞIMSIZ olduğu için
+  // geçersizleştirme proje kimliği olmadan yapılıyor (kök anahtar).
+  const policyActions = usePolicyActions(null)
+
+  const deletion = useRowDelete({
+    remove: async (policyId) => {
+      await deletePolicy(policyId)
+      return true
+    },
+    messages: DELETE_MESSAGES,
+    onDeleted: refreshList,
+  })
+
+  const columns = useMemo(
+    () =>
+      buildPolicyColumns({
+        rowOffset: (query.page - 1) * query.pageSize,
+        pendingPolicyId: deletion.pendingId,
+        canDelete: canWriteContent,
+        onDelete: deletion.request,
+        onEdit: policyActions.requestEdit,
+      }),
+    [
+      query.page,
+      query.pageSize,
+      deletion.pendingId,
+      canWriteContent,
+      deletion.request,
+      policyActions.requestEdit,
+    ],
+  )
+
+  const hasActiveFilters = query.insuranceCompanyId !== null
+
+  // Filtre çubuğu taslak durumunu kendi tutuyor; dışarıdan gelen değişim (geri
+  // tuşu, etiket kaldırma) ancak bileşen yeni bir key ile kurulunca yansır.
+  const appliedFilters = { insuranceCompanyId: query.insuranceCompanyId }
+  const filterKey = Object.values(appliedFilters).join('|')
+
+  return (
+    <div className={adminPageWidthVariants({ content: 'list', className: 'flex flex-col gap-5' })}>
+      <PageHeader
+        breadcrumb={[{ label: 'Anasayfa', to: homePath }, { label: PAGE_TITLE }]}
+        title={PAGE_TITLE}
+        countLabel={formatCountLabel(data?.totalCount)}
+      />
+
+      {policyActions.notice !== null && (
+        <NoticeBar
+          tone={policyActions.notice.tone}
+          message={policyActions.notice.message}
+          onDismiss={policyActions.dismissNotice}
+        />
+      )}
+
+      {deletion.notice !== null && (
+        <NoticeBar
+          tone={deletion.notice.tone}
+          message={deletion.notice.message}
+          onDismiss={deletion.dismissNotice}
+        />
+      )}
+
+      <PolicyFilterBar
+        key={filterKey}
+        filters={appliedFilters}
+        companies={companyRows}
+        onApply={applyFilters}
+      />
+
+      <FilterChips
+        filters={buildPolicyFilterChips({
+          filters: appliedFilters,
+          companies: companyRows,
+          onApply: applyFilters,
+        })}
+      />
+
+      {isPending && <QueryLoading message="Poliçeler yükleniyor…" />}
+
+      {isError && (
+        <QueryError message="Poliçe listesi yüklenemedi." onRetry={() => void refetch()} />
+      )}
+
+      {data !== undefined && !isError && (
+        <StaleContent isStale={isPlaceholderData}>
+          <DataTable
+            rows={data.items}
+            columns={columns}
+            rowKey={(policy) => policy.id}
+            caption={POLICY_TABLE_CAPTION}
+            minWidthClassName={POLICY_TABLE_MIN_WIDTH_CLASS}
+            emptyMessage={hasActiveFilters ? EMPTY_WITH_FILTERS : EMPTY_WITHOUT_FILTERS}
+          />
+          {data.totalCount > 0 && (
+            <Pagination
+              page={data.page}
+              pageSize={data.pageSize}
+              totalCount={data.totalCount}
+              onPageChange={setPage}
+            />
+          )}
+        </StaleContent>
+      )}
+
+      {policyActions.editTarget !== null && (
+        <PolicyEditDialog
+          policy={policyActions.editTarget}
+          isSaving={policyActions.isSaving}
+          error={policyActions.editError}
+          onDismissError={policyActions.dismissEditError}
+          onSave={policyActions.confirmEdit}
+          onClose={policyActions.cancelEdit}
+        />
+      )}
+
+      {deletion.targetId !== null && (
+        <ConfirmDialog
+          title={DELETE_DIALOG.title}
+          description={DELETE_DIALOG.description}
+          confirmLabel={DELETE_DIALOG.confirmLabel}
+          confirmTone="danger"
+          isPending={deletion.pendingId !== null}
+          onConfirm={() => void deletion.confirm()}
+          onCancel={deletion.cancel}
+        />
+      )}
+    </div>
+  )
+}
